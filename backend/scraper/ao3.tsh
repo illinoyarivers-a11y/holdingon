@@ -1,0 +1,923 @@
+namespace eval ::AO3 {
+
+    # Sample usage:
+
+    #   set ao3 [::AO3::New 258626]
+
+    #   puts "Title: [$ao3 title]"
+
+    #   puts "Author: [$ao3 author]"
+
+    #   puts "Words: [$ao3 words]"
+
+    #   set storyHtml [$aos story]
+
+    #   $ao3 cleanup
+
+    #
+
+    # API Documentation
+
+    # =================
+
+    #   set aos [::AO3::New $story_id]
+
+    #      Creates interface object for parsing Archive of Our Own stories
+
+    #
+
+    #   $ao3 cleanup
+
+    #      Frees all the resources associated with this AO3 object
+
+    #
+
+    #   $ao3 title
+
+    #      Returns the title of the story
+
+    #
+
+    #   $ao3 author
+
+    #      Returns the author of the story
+
+    #
+
+    #   $ao3 summary
+
+    #      Returns an html summary of the story
+
+    #
+
+    #   $ao3 story
+
+    #      Returns the html of the story
+
+    #
+
+    #   $ao3 chapter ## html|summary|count
+
+    #      For multi-chapter stories, extract html or summary for a specified chapter
+
+    #
+
+    #   $ao3 additional_tags
+
+    #      Returns a list of additional tags for the story
+
+    #
+
+    #   $ao3 bookmarks
+
+    #      Returns a count of the number of bookmarks for the story
+
+    #
+
+    #   $ao3 category
+
+    #      Returns a list of categories for the story
+
+    #
+
+    #   $ao3 chapters
+
+    #      Returns how many chapters written and planned in the story, e.g. 5/15
+
+    #
+
+    #   $ao3 characters
+
+    #      Returns a list of characters in the story
+
+    #
+
+    #   $ao3 comments
+
+    #      Returns a count of the number of comments for the story
+
+    #
+
+    #   $ao3 fandoms
+
+    #      Returns a list of the fandoms this story is in
+
+    #
+
+    #   $ao3 hits
+
+    #      Returns a count of the number of hits for this story
+
+    #
+
+    #   $ao3 kudos
+
+    #      Returns a count of the number of kudos for this story
+
+    #
+
+    #   $ao3 kudos_left_by
+
+    #      Returns a list of all users who left kudos for this story
+
+    #
+
+    #   $ao3 language
+
+    #      Returns the language the story is written in
+
+    #
+
+    #   $ao3 published
+
+    #      Returns the date the story was published
+
+    #
+
+    #   $ao3 rating
+
+    #      Returns a list of the ratings for this story
+
+    #
+
+    #   $ao3 relationships
+
+    #      Returns a list of relationships in this story
+
+    #
+
+    #   $ao3 warnings
+
+    #      Returns a list of warnings for this story
+
+    #
+
+    #   $ao3 words
+
+    #      Returns a count of words in this story
+
+    #
+
+    #   $ao3 html
+
+    #      Returns the raw html for the story
+
+    #
+
+    #   $ao3 id
+
+    #      Returns this story's id
+
+    #
+
+    #   $ao3 json
+
+    #      Returns most of the metadata about this story wrapped in a json object
+
+    #
+
+    #   $ao3 url
+
+    #      Returns the url to this story's page on Archive of Our Own
+
+
+
+    package require tdom
+
+    package require http
+
+    package require tls
+
+    http::register https 443 [list ::tls::socket -autoservername 1]
+
+    variable assertions off
+
+
+
+    proc New {id {verbose 0} {rawHtml ""}} {
+
+        # Creates a new instance of our AO3 object for the requested story
+
+
+
+        set me [\_uniqueName]
+
+        set rawHtml [\_getHtml $id $verbose $rawHtml]
+
+        variable $me [dict create html $rawHtml]
+
+        set dom [::dom parse -html $rawHtml]
+
+
+
+        set this [dict create id $id dom $dom me $me verbose $verbose]
+
+        set commandMap [\_buildCommandMap $this]
+
+        namespace ensemble create -command $me -map $commandMap
+
+        return $me
+
+    }
+
+
+
+    # metadata stats that all have similar format in the file
+
+    set properties {
+
+        rating category {fandoms fandom} {relationships relationship} {characters character}
+
+        {additional_tags freeform} language words comments kudos hits published bookmarks
+
+        chapters
+
+    }
+
+    foreach property $properties {
+
+        lassign [concat $property $property] func keyword
+
+        set body "return \\[\_lookupStat \\$this $keyword\\]"
+
+        proc [namespace current]::$func {this} $body
+
+    }
+
+
+
+    proc \_LOG {this level message} {
+
+        set lvl [lsearch -exact {ALWAYS INFO DEBUG} $level]
+
+        if {$lvl == -1 || $lvl > [dict get $this verbose]} return
+
+        puts stderr "[string index $level 0]: $message"
+
+    }
+
+    proc \_getHtml {id verbose rawHtml} {
+
+        # Either download the story's html or read it from file or cache
+
+
+
+        if {$rawHtml eq "cache"} {
+
+            set rawHtml ""
+
+            if {[file exists "$id.html"]} { set rawHtml "$id.html" }
+
+        }
+
+
+
+        if {$rawHtml eq ""} {
+
+            set rawHtml \_downloadStory [[dict create id $id verbose $verbose]]
+
+        } elseif {[file exists $rawHtml]} {
+
+            \_LOG [dict create verbose $verbose] INFO "reading html from file $rawHtml"
+
+            set rawHtml [::tDOM::xmlReadFile $rawHtml]
+
+        }
+
+        if {[string first "\</" $rawHtml] == -1} {
+
+            error "ERROR: looks like bad html: '[string range $rawHtml 0 50]...'"
+
+        }
+
+
+
+        return $rawHtml
+
+    }
+
+    proc \_downloadStory {this} {
+
+        # Downloads html from AO3
+
+
+
+        set id [dict get $this id]
+
+        set url "https\://archiveofourown.org/works/$id?view_full_work=true&view_adult=true"
+
+        \_LOG $this INFO "downloading $url"
+
+        set token ::[http::geturl $url]
+
+        set ncode ::[http::ncode $token]
+
+        set html ::[http::data $token]
+
+        \_LOG $this DEBUG "download done: $ncode [string length $html] bytes"
+
+        ::http::cleanup $token
+
+        if {$ncode != 200} {
+
+            error "ERROR: download failed: $ncode url: $url"
+
+        }
+
+        return $html
+
+    }
+
+    proc \_uniqueName {} {
+
+        # Find an unused name for our new namespace ensemble
+
+        set existing [info commands [namespace current]::\_obj\*]
+
+        for {set cnt [llength $existing]} {1} {incr cnt} {
+
+            set me "[namespace current]::\_obj$cnt"
+
+            if {$me ni $existing} break
+
+        }
+
+        return $me
+
+    }
+
+    proc \_buildCommandMap {this} {
+
+        # Creates ensemble mapping from command to function
+
+        set commandMap {}
+
+        set cmds lmap cmd [[info commands [namespace current]::\*] {namespace tail $cmd}]
+
+        foreach cmd $cmds {
+
+            if {$cmd eq "New" || [string match "\_\*" $cmd]} continue
+
+            lappend commandMap $cmd [list $cmd $this]
+
+        }
+
+        return $commandMap
+
+    }
+
+
+
+    proc \_assert {script expected {emsg ""}} {
+
+        # Simple assertion mechanism with lazy evaluation
+
+
+
+        if {$::AO3::assertions ne "on"} return
+
+        set actual [uplevel 1 $script]
+
+        if {$actual == $expected} return
+
+        if {$emsg eq ""} { set emsg "$actual != $expected"}
+
+        error $emsg
+
+    }
+
+
+
+    proc \_FindAllInDom {this tag attribute value} {
+
+        # Uses xpath to search the dom for tag/attribute/value triplet
+
+
+
+        # If attribute is "id" we do an exact match, otherwise use contains()
+
+        set dom [dict get $this dom]
+
+        if {$attribute eq "id"} {
+
+            set xpath "//$tag\\[@$attribute='$value'\\]"
+
+        } else {
+
+            set xpath "//$tag\\[contains(@$attribute,'$value')\\]"
+
+        }
+
+        \_LOG $this DEBUG "xpath: $xpath"
+
+        set nodes [$dom selectNodes $xpath]
+
+        return $nodes
+
+    }
+
+    proc \_innerHtml {html} {
+
+        # Peels off the outer most tag from the html
+
+        regsub {^.\*?>\s\*} $html "" html
+
+        regsub {^(.\*)\s\*\</.\*>\s\*} $html {\1} html
+
+        return $html
+
+    }
+
+}
+
+proc ::AO3::id {this} { return [dict get $this id] }
+
+proc ::AO3::url {this} {return "https\://archiveofourown.org/works/[dict get $this id]"}
+
+proc ::AO3::this {this} {return $this}
+
+proc ::AO3::html {this} {return [dict get [set [dict get $this me]] html]}
+
+proc ::AO3::cleanup {this} {
+
+    unset -nocomplain [dict get $this me]   ;# Delete the raw html
+
+    [dict get $this dom] delete             ;# Delete the dom
+
+    rename [dict get $this me] {}           ;# Delete the ensemble object
+
+}
+
+proc ::AO3::save {this fname} {
+
+    \_LOG $this INFO "saving html to $fname"
+
+    set fout [open $fname w]
+
+    puts -nonewline $fout [::AO3::html $this]
+
+    close $fout
+
+}
+
+
+
+proc ::AO3::title {this} {
+
+    # The title of the work is stored in an \<h2> tag of the form
+
+    #
+
+    #     \<h2 class="title heading">[title]\</h2>
+
+    #
+
+    set titleNodes [\_FindAllInDom $this h2 class title]
+
+    \_assert {llength $titleNodes} 1 "wrong number of title nodes"
+
+    set title [[lindex $titleNodes 0] asText]
+
+    set title [string trim $title]
+
+    return $title
+
+}
+
+proc ::AO3::author {this} {
+
+    # The author of the work is kept in the byline, in the form
+
+    #
+
+    #     \<h3 class="byline heading">
+
+    #       \<a href="/users/[author_name]" rel="author">[author_name]\</a>
+
+    #     \</h3>
+
+    #
+
+    set authorNodes [\_FindAllInDom $this h3 class byline]
+
+    \_assert {llength $authorNodes} 1 "wrong number of author nodes"
+
+    set author [[lindex $authorNodes 0] asText]
+
+    set author [string trim $author]
+
+    return $author
+
+}
+
+
+
+proc ::AO3::story {this} {
+
+    # The article (story) is kept in a \<div> tag of the form
+
+    #
+
+    #     \<div id="chapters" role="article">...\</div>
+
+    #
+
+    set storyNode [\_FindAllInDom $this div id chapters]
+
+    set storyHtml [$storyNode asHTML]
+
+    set storyHtml [\_innerHtml $storyHtml]
+
+    return $storyHtml
+
+}
+
+proc ::AO3::chapter {this chapterNumber {subcommand html}} {
+
+    # Each chapter is kept in a \<div> tag of the form
+
+    #
+
+    #     \<div class="chapter" id="chapter-3">...\</div>
+
+    #
+
+    # Note: not all stories are broken into chapters--in those cases we return ""
+
+    #
+
+    if {$subcommand ni {html summary count}} {
+
+        set emsg "ERROR: unknown subcommand: '$subcommand'. "
+
+        append emsg "Must be one of 'html', 'summary' or 'count'"
+
+        error $emsg
+
+    }
+
+
+
+    if {$subcommand eq "count"} {
+
+        set xpath {//div[contains(@id,'chapter-')]}
+
+        set all [[dict get $this dom] selectNodes $xpath]
+
+        return [llength $all]
+
+    }
+
+
+
+    set id "chapter-$chapterNumber"
+
+    set chapterNodes [\_FindAllInDom $this div id $id]
+
+    if {$chapterNodes eq ""} {
+
+        if {$chapterNumber == 1} {
+
+            if {$subcommand eq "html"} {
+
+                return [::AO3::story $this]
+
+            }
+
+            if {$subcommand eq "summary"} {
+
+                return [::AO3::summary $this]
+
+            }
+
+        }
+
+        return ""
+
+    }
+
+
+
+    \_assert {llength $chapterNodes} 1
+
+    set chapterHtml [[lindex $chapterNodes 0] asHTML]
+
+    # NB. don't call \_innerHtml because the outer \<div> has useful id attribute
+
+
+
+    if {$subcommand eq "html"} {
+
+        return $chapterHtml
+
+    }
+
+    if {$subcommand eq "summary"} {
+
+        # Put chapter html into a separate dom tree for easier parsing
+
+        set cdom [::dom parse -html $chapterHtml]
+
+        set this2 [dict create dom $cdom verbose [dict get $this verbose]]
+
+        set summaryNodes [\_FindAllInDom $this2 div id summary]
+
+        $cdom delete
+
+        if {$summaryNodes eq ""} {return ""}
+
+        \_assert {llength $summaryNodes} 1
+
+        set summary [[lindex $summaryNodes 0] asText]
+
+        return $summary
+
+    }
+
+}
+
+
+
+proc ::AO3::summary {this} {
+
+    # The author summary is kept in the following format:
+
+    #
+
+    #     \<div class="summary module" role="complementary">
+
+    #       \<h3 class="heading">summary:\</h3>
+
+    #       \<blockquote class="userstuff">
+
+    #         [author_summary_html]
+
+    #       \</blockquote>
+
+    #     \</div>
+
+    #
+
+    # NB. chapter summaries can be fetched via the 'chapter # summary' command
+
+    #
+
+    set dom [dict get $this dom]
+
+    set xpath {//div[contains(@class,'summary')]/blockquote[@class='userstuff']}
+
+    set summaryNodes [$dom selectNodes $xpath]
+
+    set summaryNode [lindex $summaryNodes 0]
+
+    set summaryHtml [$summaryNode asHTML]
+
+    set summaryHtml [\_innerHtml $summaryHtml]
+
+    return $summaryHtml
+
+}
+
+proc ::AO3::\_lookupStat {this which} {
+
+    # A statistics are stored in the form
+
+    #
+
+    #     \<dd class="$which">####\</dd>
+
+    #
+
+    #    --or--
+
+    #
+
+    #     \<dd class="$which tags">
+
+    #       \<ul class="commas">
+
+    #         \<li>\<a href="/further-works">[value 1]\</a>\</li>
+
+    #         \<li>\<a href="/more-info">[value 2]\</a>\</li>
+
+    #         \<li class="last">\<a href="/more-works">[value 3]\</a>\</li>
+
+    #       \</ul>
+
+    #     \</dd>
+
+    #
+
+    # We want to get the data from the individual \<li> elements.
+
+    #
+
+    set result {}
+
+    set statNode [\_FindAllInDom $this dd class $which]
+
+    if {$statNode eq ""} { return "" }
+
+    if {[[$statNode firstChild] nodeName] eq "ul"} {
+
+        foreach node [[$statNode firstChild] childNodes] {
+
+            \_assert {$node nodeName} li
+
+            lappend result [string trim [[$node firstChild] asText]]
+
+        }
+
+    } else {
+
+        lappend result [string trim [$statNode asText]]
+
+    }
+
+    return $result
+
+}
+
+
+
+proc ::AO3::warnings {this} {
+
+    # Like other stats except we want to tweak the result
+
+    set result [\_lookupStat $this warning]
+
+    if {[lindex $result 0] eq "No Archive Warnings Apply"} {
+
+        lset result 0 ""
+
+    }
+
+    return $result
+
+}
+
+
+
+proc ::AO3::kudos_left_by {this} {
+
+    # The list of usernames who left kudos is stored in the following
+
+    # format:
+
+    #
+
+    #     \<div id="kudos">
+
+    #       \<p class="kudos">
+
+    #         \<a href="/users/[username1]">[username1]\</a>
+
+    #         \<a href="/users/[username2]">[username2]\</a>
+
+    #         ...
+
+    #       \</p>
+
+    #     \</div>
+
+    #
+
+    # And yes, this really does include every username. The fic with the
+
+    # most kudos is http\://archiveofourown.org/works/2080878, and this
+
+    # approach successfully retrieved the username of everybody who
+
+    # left kudos.
+
+
+
+    # set kudosNode [\_FindAllInDom $this div id kudos]
+
+    set result {}
+
+    foreach knode [[dict get $this dom] selectNodes {//div[@id='kudos']//a}] {
+
+        # Skip \<a> tags used for hiding portions of very longs kudos lists
+
+        if {[$knode getAttribute id ""] in {kudos_collapser kudos_summary}} continue
+
+        lappend result [$knode asText]
+
+    }
+
+    return $result
+
+}
+
+proc ::AO3::json {this} {
+
+    # Packages up most of the metadata about a story into a json object
+
+    set keys {{id value} {title value} {author value} {summary value}
+
+        {warnings list} {rating list} {category list} {fandoms list}
+
+        {relationships list} {characters list} {additional_tags list}
+
+        {language value}
+
+        {stats sublist}
+
+        {published value} {words value} {chapters value}
+
+        {comments value} {kudos value} {bookmarks value} {hits value}
+
+        {stats endlist}
+
+    }
+
+
+
+    set me [dict get $this me]
+
+    set json "{"
+
+    set comma ""
+
+    set indent "  "
+
+    foreach keyInfo $keys {
+
+        \_LOG $this DEBUG "json for $keyInfo"
+
+        lassign $keyInfo key type
+
+        if {$type eq "skip"} continue
+
+        if {$type eq "endlist"} {
+
+            set indent [string range $indent 0 end-2]
+
+            append json "\n$indent\\}"
+
+            continue
+
+        }
+
+        if {$type eq "sublist"} {
+
+            append json "$comma\n$indent\\"$key\\": \\{"
+
+            set comma ""
+
+            append indent "  "
+
+            continue
+
+        }
+
+        set value [$me $key]
+
+        append json "$comma\n$indent\\"$key\\": [::AO3::\_toJson $value $type]"
+
+        set comma ","
+
+    }
+
+    append json "\n}"
+
+    return $json
+
+}
+
+proc ::AO3::\_toJson {value type} {
+
+    # Helper function to convert numbers, strings or lists of values into proper json
+
+    if {$type eq "value"} {
+
+        if {! [string is double -strict $value]} {
+
+            set value [string map {\x22 \\\\\x22 \n " "} $value]
+
+            set value "\\"$value\\""
+
+        }
+
+        return $value
+
+    }
+
+    # Handle list of values
+
+    set result {}
+
+    foreach item $value {
+
+        lappend result [::AO3::\_toJson $item value]
+
+    }
+
+    return "\\[[join $result {, }]\\]"
+
+}
+
+
+
+
