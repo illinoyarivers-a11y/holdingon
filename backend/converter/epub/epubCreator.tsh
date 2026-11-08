@@ -1,0 +1,858 @@
+package require fileutil
+package require base64
+package require textutil
+
+set version "0.5"
+array set E {
+    data {}
+    title {*}
+    author {*}
+    cover {*}
+    images {*}
+    css {*}
+    html {*}
+    output {*}
+    toc 1
+    verbose 1
+    tk 0
+    zip {*}
+}
+
+
+set usage {usage:
+    epubCreator -data file1.txt file2.xhtml file3.xhtml...
+
+    epubCreator
+      -data file1.txt file2.xhtml file3.xhtml...
+      -title 'Book Title'
+      -author 'last, first'
+      -cover Cover.jpg
+      -images <additional Images>
+      -css stylesheet.css
+      -toc (0/1)
+      -html (0/1)
+      -verbose (0/1)
+      -tk (0/1)
+      -output BookName.epub
+
+ -data        (required) List of data files to include in the text
+ -title       Title for book
+              default: extracts title from <title>...</title>
+ -author      Name of author as last, first
+              default: extracts author from <meta name='author'.../>
+ -cover       An image file for the cover, use "" for no cover
+              default: a cover image will be created using ImageMagick
+ -images      Additional images that might be reference by text
+              default: extracts image tags from all the source files
+ -css         An optional css file if you want special formatting
+              default: extracts stylesheets referenced in all the source files
+ -toc         1 include a TOC after the cover page, 0 omit TOC
+              default: 1 include TOC
+ -html        1 if data already HTML, 0 if text
+              default: examines each source files for its format
+ -verbose     1 for more verbose messages
+ -tk          Make cover image: 0 use ImageMagick, 1 use Tk if no ImageMagick
+              default: 0 use ImageMagick
+ -output      The name for the .epub file, use "" for no output
+              default: uses basename of the first source file
+
+By default, epubCreator will examine the source files for title,
+author, css and images. It will create a cover image, a cover
+page and table of contents for you. You can disable any of these
+features by specifying an empty value for the appropriate flag.
+}
+
+array set media_types {"" "" .png image/png .gif image/gif .jpg image/jpeg
+    .jpeg image/jpeg .svg image/svg+xml .css text/css}
+
+proc Usage {emsg} {
+    puts stderr $emsg$::usage
+    if {$::tcl_interactive} {error ""}
+    exit 0
+}
+proc INFO {msg} {if {$::E(verbose)} {puts "I: $msg"}}
+proc WARN {msg} {puts stderr "W: $msg" ; flush stderr}
+proc ERROR {msg} {puts stderr "E: $msg" ; exit 1 }
+proc INFO_LIST {who values} {
+    set msg "found [Plural [llength $values] $who]"
+    if {$values ne {}} {
+        append msg ": [join $values {, }]"
+    }
+    INFO $msg
+}
+
+proc ParseArgs {} {
+    global E argv
+
+    if {"-help" in $argv || "--help" in $argv} { Usage "" }
+    if {[string index [lindex $argv 0] 0] ne "-"} {
+        Usage "Error: bad option [lindex $argv 0]\n\n"
+    }
+    foreach arg $argv {
+        if {([string first "-" $arg] == 0)} {
+            set index [string range $arg 1 end]
+            if {![info exists E($index)]} {
+                Usage "Error: unknown option '$arg'\n\n"
+            }
+            set E($index) {}
+        } else {
+            if {[llength $E($index)] == 0} {
+                set E($index) $arg
+            } else {
+                lappend E($index) $arg
+            }
+        }
+    }
+    if {[llength $E(data)] == 0} {
+        Usage "Error: no input files specified\n\n"
+    }
+
+    # Allow -verbose, -tk and -toc to be flags without values
+    foreach idx {verbose tk toc} {
+        if {$E($idx) eq ""} { set E($idx) 1 }
+    }
+    INFO "creating epub from [Plural [llength $E(data)] {data file}]"
+}
+proc Init {} {
+    global E
+    set guid [guid]
+    if {$E(zip) eq "*" || $E(zip) eq ""} {
+        set E(output,tempdir) [file join [::fileutil::tempdir] "epubCreator_$guid"]
+    } else {
+        set E(output,tempdir) $E(zip)
+    }
+    INFO "tempdir $E(output,tempdir)"
+
+    ExtractMetadata
+    if {$E(title) eq "*"} {
+        set E(title) "My Ebook"
+        INFO "no title information found, using $E(title)"
+    }
+    if {$E(author) eq "*"} {
+        set E(author) "epubCreator"
+        set E(author,pretty) $E(author)
+        INFO "no author information found, using $E(author)"
+    } else {
+        set E(author,pretty) $E(author)
+        set rest [lassign [split $E(author) ","] last first]
+        if {$rest eq "" && $first ne ""} {
+            set E(author,pretty) "[string trim $first] [string trim $last]"
+            INFO "author pretty name: $E(author,pretty)"
+        }
+    }
+
+    if {$E(output) eq "*"} {
+        set E(output,final) [file normalize "[file rootname [lindex $E(data) 0]].epub"]
+    } elseif {$E(output) eq ""} {
+        set E(output,final) ""
+    } else {
+        set E(output,final) [file normalize "[file rootname $E(output)].epub"]
+    }
+
+    set E(epub) EPUB
+    set E(epub,tempdir) [file join $E(output,tempdir) $E(epub)]
+    set E(opf,name)  [file join $E(epub) package.opf]
+    set E(opf,tempname)  [file join $E(output,tempdir) $E(opf,name)]
+    set E(nav,tempname) [file join $E(epub,tempdir) "nav.xhtml"]
+    set E(ncx,tempname) [file join $E(epub,tempdir) "toc.ncx"]
+    set E(mimetype) mimetype
+    set E(mimetype,tempname) [file join $E(output,tempdir) $E(mimetype)]
+    set E(meta-inf) META-INF
+    set E(meta-inf,tempdir) [file join $E(output,tempdir) $E(meta-inf)]
+    set E(meta-inf,tempname) [file join $E(meta-inf,tempdir) container.xml]
+    set E(date) [clock format [clock seconds] -gmt 1 -format "%Y-%m-%dT%TZ"]
+    set E(guid) "ebook:$guid"
+
+    if {$E(cover) eq "*" && ! [::BlankCover::CanMakeCoverImage]} {
+        INFO "skipping making cover image, requires ImageMagick"
+        set E(cover) ""
+    }
+    if {$E(cover) eq "*"} {
+        set E(cover,source) [file join $E(epub,tempdir) "_created_cover.jpg"]
+    } else {
+        set E(cover,source) $E(cover)
+    }
+    set E(cover,name) [file tail $E(cover,source)]
+    set E(cover,media_type) $::media_types([file extension $E(cover,source)])
+
+    set E(manifest,stylesheets) "    <!-- stylesheet.css items -->"
+    set E(manifest,images) "    <!-- image items -->"
+    set E(css,link) "    <!-- link to stylesheet.css -->"
+
+    file delete -force $E(output,tempdir)
+    file mkdir $E(output,tempdir)
+    file mkdir $E(meta-inf,tempdir)
+    file mkdir $E(epub,tempdir)
+    file mkdir [file dirname $E(output,final)]
+
+    return
+}
+proc MakeEpubFiles {} {
+    global E
+
+    MakeOPF_Stylesheets
+    MakeOPF_Images
+
+    set ncxs ""
+    set navs ""
+    set E(manifest,sources) {}
+    set E(opf,spine_items) ""
+    set play_order -1
+
+    if {$E(cover,source) ne ""} {
+        if {$E(cover) eq "*"} {
+            ::BlankCover::MakeCoverImage $E(title) $E(author,pretty) $E(cover,source)
+        } else {
+            INFO "adding cover image: [file tail $E(cover,source)]"
+            file copy $E(cover,source) $E(epub,tempdir)
+        }
+        incr play_order
+        set html_name [MakeCoverPage]
+        set navlabel "Cover Page"
+        append navs [subst $::NAV_XHTML1]
+        append ncxs [subst $::CONTENT_NCX1]
+    } else {
+        INFO "skipping cover page"
+    }
+
+    # Add our table of contents (nav.xhtml) unless user asks not to or if
+    # there's only 1 source file
+    if {$E(toc) == 2 || ($E(toc) && [llength $E(data)] > 1)} {
+        INFO "adding TOC"
+        incr play_order
+        set html_name [file tail $E(nav,tempname)]
+        set navlabel "Table of Contents"
+        append navs [subst $::NAV_XHTML1]
+        append ncxs [subst $::CONTENT_NCX1]
+    } else {
+        INFO "skipping TOC"
+    }
+
+    # Add all our source files
+    for {set idx 0} {$idx < [llength $E(data)]} {incr idx} {
+        # 1. add item into manifest
+        # 2. add item into spine
+        # 3. extract title for nav and toc
+        # 4. add item into nav.xhtml
+        # 5. add item into toc.ncx
+        # 6. copy file to $E(epub,tempdir) to be zipped up
+        #    a. possibly convert to xhtml
+
+        set data_file [lindex $E(data) $idx]
+        INFO "processing $data_file"
+        set html_name "[file tail [file rootname $data_file]].xhtml"
+        set manifest_id "id_file_$idx"
+        append E(manifest,sources) \
+            "    <item id='$manifest_id' href='$html_name' media-type='application/xhtml+xml'/>\n"
+        append E(opf,spine_items) "    <itemref idref='$manifest_id'/>\n"
+
+        set navlabel [GuessChapterTitles $data_file [expr {$idx + 1}]]
+        incr play_order
+        append navs [subst $::NAV_XHTML1]
+        append ncxs [subst $::CONTENT_NCX1]
+
+        set tempname [file join $E(epub,tempdir) $html_name]
+        CopyTextFile $data_file $tempname
+    }
+    WriteAllData $E(mimetype,tempname) "application/epub+zip"
+    WriteAllData $E(meta-inf,tempname) [subst $::CONTAINER_XML]
+    WriteAllData $E(opf,tempname) [MakeOPF]
+    WriteAllData $E(nav,tempname) "$::NAV_XHTML0\n$navs$::NAV_XHTML2"
+    WriteAllData $E(ncx,tempname) "[subst $::CONTENT_NCX0]\n$ncxs\n$::CONTENT_NCX2"
+}
+##+##########################################################################
+#
+# TextToHtml -- Converts text files to html by adding correct header and footer
+#
+proc TextToHtml {src} {
+    global E
+
+    set data [ReadAllData $src]
+    if {! [IsHtmlData $data]} {
+        INFO "converting $src to html"
+        set data [string map {& &amp; < &lt; > &gt; \x22 &quot; ' &apos;} $data] ; list
+        regsub -all -line {^$} $data {</p><p>} data
+        set data "<p>$data</p>"
+
+        set data [MakeHtmlPage $data $E(title)]
+    } else {
+        set data [FixHtml $data]
+        if {! [HasHtmlHeader $data]} {
+            INFO "adding header"
+            set data [MakeHtmlPage $data $E(title)]
+        }
+    }
+    return $data
+}
+proc IsHtmlData {data} {
+    if {$::E(html) ne "*"} { return $::E(html) }
+    if {[string first "<html" $data] > -1} { return 1 }
+    if {[string first "<p" $data] > -1} { return 1 }
+    return 0
+}
+proc HasHtmlHeader {data} {
+    if {[string first "<html" $data] > -1} { return 1 }
+    return 0
+}
+proc FixHtml {data} {
+    # Found some pages had "<br >" without closing slash
+    return [regsub -all {<br *>} $data {<br/>}]
+}
+proc MakeHtmlPage {body title} {
+    global E
+
+    set html "[subst $::HTML_TEMPLATE]"
+    return $html
+}
+proc Plural {num word} {
+    if {$num != 1} {append word "s"}
+    return "$num $word"
+}
+proc MakeCoverPage {} {
+    global E
+
+    set html_name "cover.xhtml"
+    set tempname [file join $::E(epub,tempdir) $html_name]
+    set fout [open $tempname w]
+    puts $fout [MakeHtmlPage "<img src=\"$E(cover,name)\"/>" $E(title)]
+    close $fout
+    return $html_name
+}
+proc MakeOPF {} {
+    global E
+
+    set opf [subst $::PACKAGE_OPF]
+    if {$E(cover,source) eq ""} {
+        INFO "removing cover page from opf"
+        regsub -all -line {^.*id_cover.*$} $opf "<!-- \& -->" opf
+    }
+    if {! $E(toc)} {
+        INFO "removing TOC from spine"
+        regsub -all -line {^.*<itemref idref=.id_navpage.*$} $opf "<!-- \& -->" opf
+    }
+
+    return $opf
+}
+
+proc MakeOPF_Images {} {
+    global E
+    if {[llength $E(images)] == 0} return
+
+    set E(manifest,images) ""
+    for {set i 0} {$i < [llength $E(images)]} {incr i} {
+        set fname [lindex $E(images) $i]
+        file copy $fname $E(epub,tempdir)
+        set tailname [file tail $fname]
+        set media $::media_types([file extension $fname])
+        set id "id_image_$i"
+        append E(manifest,images) \
+            "    <item href='$tailname' id='$id' media-type='$media'/>\n"
+        INFO "adding image $tailname"
+    }
+}
+proc MakeOPF_Stylesheets {} {
+    global E
+
+    if {[llength $E(css)] == 0} return
+    set E(manifest,stylesheets) ""
+    set E(css,link) ""
+    for {set i 0} {$i < [llength $E(css)]} {incr i} {
+        set fname [lindex $E(css) $i]
+        file copy $fname $E(epub,tempdir)
+        set tailname [file tail $fname]
+        set id "id_css_$i"
+        set media "text/css"
+
+        append E(manifest,stylesheets) \
+            "    <item href='$tailname' id='$id' media-type='$media'/>\n"
+        append E(css,link) "    <link href='$tailname' type='$media' rel='stylesheet'/>\n"
+        INFO "adding stylesheet $tailname"
+    }
+}
+##+##########################################################################
+#
+# ZipEpub -- zips up all the files in E(output,tempdir) making sure that
+# mimetype is first and uncompressed, followed by everything else.
+#
+# ::zipfile::encode v0.3 doesn't work--no way to ensure mimetype is
+# first and uncompressed.
+#
+proc ZipEpub {} {
+    global E
+    if {$E(output) eq ""} {
+        INFO "skipping zipping"
+        return
+    }
+    INFO "zipping $E(output,final)"
+    set old_pwd [pwd]
+    cd $E(output,tempdir)
+
+    catch {file delete $E(output,final)}
+
+    catch {package require zipfile::encode 0.4} ;# Not yet released
+    if {[info commands ::zipfile::encode] ne ""} {
+        set zip [::zipfile::encode epubCreator_zipper]
+        $zip comment: "Created with epubCreator on $E(date)"
+        INFO "  zip file: $E(mimetype) nocompress=true"
+        $zip file: $E(mimetype) 0 $E(mimetype) 1
+        INFO "  zip file: $E(meta-inf)/* $E(epub)/*"
+        foreach fname [glob $E(meta-inf)/* $E(epub)/*] {
+            $zip file: $fname 0 $fname
+        }
+        $zip write $E(output,final)
+    } else {
+        INFO "  zip -0X $E(output,final) $E(mimetype)"
+        exec zip -0X $E(output,final) $E(mimetype)
+        INFO "  zip -rX $E(output,final) $E(meta-inf)/ $E(epub)/"
+        exec zip -rX $E(output,final) $E(meta-inf)/ $E(epub)/
+    }
+    cd $old_pwd
+}
+proc CopyTextFile {src dest} {
+    WriteAllData $dest [TextToHtml $src]
+}
+proc WriteAllData {fname data} {
+    INFO "copying [file tail $fname]"
+    set fout [open $fname w];
+    puts -nonewline $fout $data;
+    close $fout;
+}
+proc ReadAllData {fname} {
+    if {! [file exists $fname]} {
+        ERROR "file $fname does not exists"
+    }
+    set fin [open $fname r]
+    set data [read $fin] ; list
+    close $fin
+    return $data
+}
+proc Cleanup {} {
+    global E
+    if {$E(output) eq ""} {
+        INFO "skipping cleanup"
+        return
+    }
+    INFO "cleanup $E(output,tempdir)"
+    file delete -force -- $E(output,tempdir)
+}
+##+##########################################################################
+#
+# Searches data file for title, author and links to images and stylesheets
+#
+proc ExtractMetadata {} {
+    global E
+
+    if {$E(html) == 0} return
+    if {$E(title) ne "*" && $E(author) ne "*" &&
+        $E(css) ne "*" && $E(images) ne "*"} return
+
+    set all(stylesheet) {}
+    set all(image) {}
+    foreach data_name $E(data) {
+        set html [ReadAllData $data_name] ; list
+        if {! [IsHtmlData $html]} continue
+
+        if {$E(title) eq "*"} {
+            set n [regexp {<title>(.*?)</title>} $html . title]
+            if {$n} {
+                set E(title) $title
+                INFO "found title: $E(title)"
+            }
+        }
+        if {$E(author) eq "*"} {
+            # <meta name="author" content="Keith Vetter"/>
+            foreach meta [regexp -all -inline -indices {<meta [^>]*name=.author[^>]*>} $html] {
+                set author [ExtractAttributeForTag [string range $html {*}$meta] meta content]
+
+                if {$author ne ""} {
+                    set E(author) [lindex $author 0]
+                    INFO "found author: $E(author)"
+                    break
+                }
+            }
+        }
+
+        # Pick up css and images
+        set dirname [file dirname $data_name]
+        foreach {who tag attr} {stylesheet link href    image img src} {
+            set all_values {}
+            foreach tag [regexp -all -inline "<${tag}\\M.*?>" $html] {
+                set n [regexp " $attr=(\[\"'])(.*?)\\1" $tag a b value]
+                if {$n && $value ni $all_values} { lappend all_values $value }
+            }
+            foreach path $all_values {
+                set actual [FindResourceFile $who $dirname $path]
+                if {$actual ne "" && $actual ni $all($who)} {
+                    lappend all($who) $actual
+                }
+            }
+        }
+    }
+
+    if {$E(css) eq "*"} {
+        set E(css) $all(stylesheet)
+        INFO_LIST stylesheet $E(css)
+    }
+    if {$E(images) eq "*"} {
+        set E(images) $all(image)
+        INFO_LIST image $E(images)
+    }
+}
+##+##########################################################################
+#
+# Insures path exists, either as absolute path or directly in dirname
+#
+proc FindResourceFile {type dirname path} {
+    if {[file pathtype $path] eq "relative" && [llength [file split $path]] > 1} {
+        WARN "skipping $type: directory not allowed in path: $path"
+        return ""
+    }
+    set full [file join $dirname $path]
+    if {[file exists $full]} { return $full }
+    WARN "skipping $type: cannot locate file: $path"
+    return ""
+}
+##+##########################################################################
+#
+# Returns the attr value for each instance of <tag> in html
+#
+proc ExtractAttributeForTag {html tag attr} {
+    set all {}
+    foreach tag [regexp -all -inline "<${tag}\\M.*?>" $html] {
+        set n [regexp " $attr=(\[\"'])(.*?)\\1" $tag a b value]
+        if {$n && $value ni $all} { lappend all $value }
+    }
+    return $all
+}
+##+##########################################################################
+#
+# Tries to extract the <title>...</title> text to use
+# as chapter title
+#
+proc GuessChapterTitles {fname chapter} {
+    set data [ReadAllData $fname]
+
+    set navlabel "Chapter $chapter"
+    set n [regexp {<title>(.*?)</title>} $data . navlabel]
+    if {! $n} {
+        regexp {<h3[^>]+?title=['"](.*?)["']} $data . navlabel
+    }
+    INFO "chapter $chapter title: => $navlabel"
+    return $navlabel
+}
+##+##########################################################################
+#
+# guid -- like uuid::uuid generate but that functions displays a warning on OSX
+#
+proc guid { } {
+    if {![info exists ::GuiD__SeEd__VaR]} {set ::GuiD__SeEd__VaR 0}
+    if {![info exists ::GuiD__MaChInFo__VaR]} {
+       set ::GuiD__MaChInFo__VaR $::tcl_platform(user)[info hostname]$::tcl_platform(machine)$::tcl_platform(os)
+    }
+
+    set MachInfo [expr {rand()}]$::GuiD__SeEd__VaR$::GuiD__MaChInFo__VaR
+    binary scan $MachInfo h* MachInfo_Hex
+    set CmdCntAndSeq [string range "[info cmdcount]$::GuiD__SeEd__VaR$::GuiD__SeEd__VaR" 0 8]
+    binary scan [expr {rand()}] h* Rand_Hex
+
+    set guid [format %2.2x [clock seconds]]
+    # Pick though clock clicks for a good sequence.
+    append guid -[string range [format %2.2x [clock clicks]] 0 3] \
+        -[string range [format %2.2x $CmdCntAndSeq] 0 3] \
+        -[string range $Rand_Hex 3 6] \
+        -[string range $MachInfo_Hex 0 11]
+    incr ::GuiD__SeEd__VaR
+
+    return [string toupper $guid]
+}
+################################################################
+#
+# Makes a cover image
+#
+namespace eval ::BlankCover {
+    variable blank_cover_tile {
+        /9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a
+        HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIy
+        MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCABAAEADASIA
+        AhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQA
+        AAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3
+        ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWm
+        p6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEA
+        AwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSEx
+        BhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElK
+        U1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3
+        uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi2xgE
+        jIHON3OP8/yo6r1XbnGM8etKQQ27IJU9D1xik8zcMP8Ad7kt+h44rzj0BTv9eOON3akGMlc5PoeK
+        aApG4EA9cEZ/Wg7QoJU9PmwQB/OmIdnBzvy3Rffnpn1o24YqPlOfb0pOn1bg8DP/ANel3Zx13diT
+        xkdv8/0oATJLbDj5ufmX6/T0zQAQmBlk6cnHHcH/AD+VKwyGz97sev8AkUg+QsR0/un9KAFHylct
+        n+Erx1z0/nSjKhMgjjGfX0P+fWmA4UFhtYdh049qdtYkjI+ZuRigBeA/zZLZ7df85pM7SoG4svqP
+        wpvDBApP17A9f8/hSjnqoI/3u/8A+ugALMRgSAEtyCMHPT+Qo+Zh/ex7f05oIThiCgHfOMUrgKMg
+        5IyeB/n1/WgAUEA7Ccngg8YpCzFQyx/N6/h+ff0pMlS4xtwMkfT3pzKQSoIBAycnvQAhAIITvwRg
+        YH+eaXcQD949+RyPr+vNNIV9qkDdkAkj/GlbeDsz1/CgAwCADkZbqeo4PT9KcRkMVLYP94f4U0sF
+        3Y2gd8c/h/npRhQ+VyT1BxmgA6EfJyD/AHcZ4/8A1UctlQHJwQRnH+e9OAJ+8/fjAz+tMVTjrweD
+        u7n/ADmgB4Zy2SMlh03Y/KkAxtGWAxjhenp19qAwDbhkY7fl2pGI2NhFI/u46D/P86AH9FA3de56
+        nnimHdtXOQD684P50oXPzdGJ7etKV5+9nBzwhoGxozxhsdOo9KRwME4KnHTIOfWnKwO4A8f71Ivz
+        YGMhuQB9D3oEA2hf4lOecfKBz7UAbWYZbvzmjJCllOG9ex+lAGGUIARjHTjFMAO0gk7d3B4PI55F
+        BbnCk5xzlqXjnKk7eq+n/wBagEbfRlPYc4/H8aQH/9k=}
+    proc CanMakeCoverImage {} {
+        if {$::E(tk) > 1} { set ::auto_execs(convert) "" } ;# Hidden way to force Tk
+        if {[auto_execok convert] ne "" && [auto_execok montage] ne ""} { return 1 }
+        if {$::E(tk) == 0} { return 0 }
+        foreach pkg {Tk Img} {
+            set n [catch [list package require $pkg] emsg]
+            if {$n} {
+                WARN "cannot load $pkg: $emsg"
+                return 0
+            }
+            wm withdraw .
+        }
+        return 1
+    }
+    proc MakeCoverImage {title author output_image} {
+        if {[auto_execok convert] ne ""} {
+            INFO "creating cover image using ImageMagick"
+            MakeBlankCover $output_image
+            WriteOntoBlankCover $title $author $output_image
+        } else {
+            MakeCoverImage_Tk $title $author $output_image
+        }
+    }
+
+    proc MakeBlankCover {output_image} {
+        set fout [open $output_image wb]
+        puts -nonewline $fout [::base64::decode $::BlankCover::blank_cover_tile]
+        close $fout
+
+        # Tile our blank_cover_tile
+        INFO "  montage -mode concatenate -tile 8x12 \$img*96 \$img"
+        exec montage -mode concatenate -tile 8x12 \
+            {*}[lrepeat [expr {8 * 12}] $output_image] $output_image
+
+        ;# Add black border around page
+        INFO [sjoin "  convert \$img -fill none -stroke black -strokewidth 10 " \
+                  "-draw {rectangle 20 20 492 748} \$img"]
+        exec convert $output_image -fill none -stroke black -strokewidth 10 \
+            -draw {rectangle 20 20 492 748} $output_image
+    }
+    proc WriteOntoBlankCover {title author output_image} {
+        set font [WhichImageMagickFont]
+        INFO "  using ImageMagick font '$font'"
+        if {$font ne ""} { set font "-font $font" }
+        set title [::textutil::adjust $title -length 18 -strictlength true]
+        set author [::textutil::adjust $author -length 18 -strictlength true]
+        set txt "$title\n\nby\n$author"
+        set cmd [list convert $output_image -fill black -stroke black {*}$font]
+        lappend cmd -pointsize 64 -gravity north -annotate +0+100 $txt $output_image
+        INFO [sjoin "  convert \$img -fill black -stroke black $font -pointsize 64 " \
+              "-gravity north -annotate +0+100 \$title \$img"]
+        exec {*}$cmd
+    }
+    proc WhichImageMagickFont {} {
+        # ImageMagick doesn't seem to have consistent font names across systems
+        # so we list all available fonts and search for a Times Roman font.
+        set fin [open "|convert -list font" r]
+        set all [read $fin] ; list
+        catch {close $fin} ;# convert exits with non-zero status
+        set times(all) {}
+        set times(good) {}
+        foreach {. font} [regexp -inline -all -line {^.*Font: (.*Times.*)$} $all] {
+            set font_ [string map {- ""} $font]
+            if {$font_ eq "Times"} {return $font}
+            if {$font_ eq "TimesRoman"} { return $font }
+            if {$font_ eq "TimesNewRoman"} { return $font }
+            lappend times(all) $font
+            if {[string match -nocase "*italic" $font]} continue
+            if {[string match -nocase "*I" $font]} continue
+            if {[string match -nocase "*oblique" $font]} continue
+            if {[string match -nocase "*O" $font]} continue
+            lappend times(good) $font
+        }
+        if {$times(good) ne {}} { return [lindex $times(good) 0] }
+        return [lindex $times(all) 0]
+    }
+    proc MakeCoverImage_Tk {title author output_image} {
+        if {[package version Img] eq ""} { ERROR "requires Img package" }
+
+        INFO "creating cover image using Tk"
+        foreach img [image names] {
+            if {[string match "::cover::*" $img]} { image delete $img }
+        }
+        image create photo ::cover::tile -data [::base64::decode $::BlankCover::blank_cover_tile]
+        image create photo ::cover::blank_cover -width 512 -height 768
+        ::cover::blank_cover copy ::cover::tile -to 0 0 512 768
+
+        set font {Times 40 bold}
+        set title [::textutil::adjust $title -length 18 -strictlength true]
+        set author [::textutil::adjust $author -length 18 -strictlength true]
+        set txt "$title\n\nby\n$author"
+
+        destroy .c
+        wm deiconify .
+        wm geom . -10000-10000
+        pack [canvas .c -width 512 -height 768 -bd 0 -highlightthickness 0]
+        .c create image 0 0 -anchor nw -image ::cover::blank_cover
+        .c create rect 20 20 492 748 -fill {} -outline black -width 10
+        # .c create text 256 50 -font $font -tag a -anchor n -justify center -text $txt
+        set y 50
+        foreach line [split [string trim $txt] \n] {
+            .c create text 256 $y -font $font -tag b -anchor n -justify center -text $line
+            incr y 50
+        }
+
+        ;# Now copy canvas into an image and save it
+        raise .
+        update
+        image create photo ::cover::cover -data .c
+        ::cover::cover write $output_image -format jpeg
+
+        wm withdraw .
+        destroy .c
+        foreach img [image names] {
+            if {[string match "::cover::*" $img]} { image delete $img }
+        }
+    }
+}
+proc sjoin {args} { return [join $args ""] }
+
+################################################################
+#
+# Various XHTML templates
+#   HTML_TEMPLATE -- convert text into xhtml, also used by cover page
+#   CONTAINER_XML -- for META-INF/container.xml
+#   PACKAGE_OPF -- for the EPUB/package.opf file
+#   NAV_XHTML# -- for the nav.xhtml navigation document
+#   CONTENT_NCX# -- for the EPub version 2.0 toc.ncx navigation document
+#
+set HTML_TEMPLATE {<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en"
+      xmlns:epub="http://www.idpf.org/2007/ops">
+  <head>
+    <title>$title</title>
+$::E(css,link)
+  </head>
+  <body>
+    $body
+  </body>
+</html>
+}
+
+set CONTAINER_XML {<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile media-type="application/oebps-package+xml"
+             full-path="$E(opf,name)" />
+  </rootfiles>
+</container>
+}
+
+set PACKAGE_OPF {<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uuid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>$E(title)</dc:title>
+    <dc:creator>$E(author)</dc:creator>
+    <dc:identifier id="uuid">$E(guid)</dc:identifier>
+    <dc:language>en</dc:language>
+    <meta property="dcterms:modified">$E(date)</meta>
+    <meta name="cover" content="id_cover_image"/>
+  </metadata>
+  <manifest>
+    <item id="id_cover_image" href="$E(cover,name)" media-type="$E(cover,media_type)"/>
+    <item id="id_coverpage" href="cover.xhtml" media-type="application/xhtml+xml"/>
+    <item id="id_navpage" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml" />
+
+$::E(manifest,sources)
+$::E(manifest,stylesheets)
+$::E(manifest,images)
+  </manifest>
+  <spine toc="toc">
+    <itemref idref="id_coverpage"/>
+    <itemref idref="id_navpage"/>
+$::E(opf,spine_items)
+  </spine>
+</package>
+}
+
+# EPUB 3.0 section 2.2 EPUB Navigation Document
+# see http://www.idpf.org/epub/301/spec/epub-contentdocs.html#sec-xhtml-nav
+set NAV_XHTML0 {<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en"
+      xmlns:epub="http://www.idpf.org/2007/ops">
+  <head>
+  <title>Table of Contents</title>
+  </head>
+  <body>
+  <nav epub:type="toc" id="toc">
+    <h1>Table of Contents</h1>
+    <ol>}
+set NAV_XHTML1 {        <li><a href="$html_name">$navlabel</a></li>
+}
+set NAV_XHTML2 {    </ol>
+  </nav>
+</body>
+</html>
+}
+# NCX format
+# see: http://www.idpf.org/epub/20/spec/OPF_2.0.1_draft.htm#Section2.4.1.2
+# also: http://gbenthien.net/Kindle%20and%20EPUB/ncx.php
+set CONTENT_NCX0 {<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="en">
+<head>
+  <meta name="dtb:uid" content="$::E(guid)"/>
+  <meta name="dtb:depth" content="1"/>
+  <meta name="dtb:totalPageCount" content="0"/>
+  <meta name="dtb:maxPageNumber" content="0"/>
+</head>
+<docTitle>
+  <text>$E(title)</text>
+</docTitle>
+<docAuthor>
+  <text>$E(author)</text>
+</docAuthor>
+<navMap>}
+
+set CONTENT_NCX1 {  <navPoint id="navpoint-$play_order" playOrder="$play_order">
+    <navLabel>
+      <text>$navlabel</text>
+    </navLabel>
+    <content src="$html_name"/>
+  </navPoint>}
+
+set CONTENT_NCX2 {</navMap>
+</ncx>
+}
+
+################################################################
+################################################################
+
+proc Main {} {
+    global E
+
+    set E(when) [clock milliseconds]
+    ParseArgs
+    Init
+    MakeEpubFiles
+    ZipEpub
+    Cleanup
+    set done "created $E(output,final)"
+    if {$E(output) eq ""} { set done "epub in $E(output,tempdir)" }
+    INFO $done
+    INFO "elapsed time: [expr {[clock milliseconds] - $E(when)}]ms"
+    INFO "to upload to Google books, goto https://play.google.com/books/uploads"
+    if {! $E(verbose)} { puts $done }
+}
+
+puts "\nepubCreator v$version\nby Keith Vetter & Clif Flynt\n"
+if {$tcl_interactive} {
+    set argv {-data _data/epub_1_1.html -author "Keith Vetter" -output ~/FBooks/me.epub
+        -verbose 1}
+    set argv {-data "/tmp/foo_13569879.html" -verbose 1 -output "~/FBooks/me.epub"
+        -title "Another Innocent Bystander" -author "Rose_Milburn"}
+    return
+}
+if {"-data" ni $argv || [llength $argv] < 2} { Usage "" }
+
+Main
+exit
+return
+
