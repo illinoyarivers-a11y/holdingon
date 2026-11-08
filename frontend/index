@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#252a31">
+  <title>fic2epub — AO3 to EPUB</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="fic2epub home"><span class="brand-mark">f.</span> fic2epub</a>
+      <span class="local-label"><span class="dot"></span> LOCAL TOOL</span>
+    </header>
+
+    <section class="hero">
+      <p class="eyebrow">YOUR PERSONAL AO3 CONVERTER</p>
+      <h1>Your stories,<br><em>offline.</em></h1>
+      <p class="intro">Turn an Archive of Our Own work into an EPUB you can read anywhere.</p>
+    </section>
+
+    <section class="converter-card" aria-labelledby="form-title">
+      <h2 id="form-title">Convert a work</h2>
+      <form id="convert-form">
+        <label for="ao3-url">AO3 work URL</label>
+        <div class="input-wrap">
+          <input id="ao3-url" name="url" type="url" placeholder="https://archiveofourown.org/works/12345678" autocomplete="url" required>
+        </div>
+        <button id="convert-button" type="submit"><span class="button-label">Convert to EPUB</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+      </form>
+      <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+      <a id="download-link" class="download-link" hidden>Download EPUB <span aria-hidden="true">↓</span></a>
+    </section>
+
+    <section class="steps" aria-label="How it works">
+      <h2>Three steps, one EPUB.</h2>
+      <ol>
+        <li><span>01</span><div><strong>Paste a work link</strong><p>Use an AO3 work URL.</p></div></li>
+        <li><span>02</span><div><strong>Let the converter work</strong><p>Chapters are extracted and packaged.</p></div></li>
+        <li><span>03</span><div><strong>Download and read</strong><p>Your EPUB is ready for your e-reader.</p></div></li>
+      </ol>
+    </section>
+
+    <footer>
+      <p>Runs on your computer. Your link and EPUB are not uploaded to a public converter.</p>
+      <p class="disclaimer">An unofficial personal tool; not affiliated with or endorsed by AO3.</p>
+    </footer>
+  </main>
+</body>
+</html>
