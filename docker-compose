@@ -1,0 +1,9 @@
+services:
+  ao3-epub:
+    build: .
+    environment:
+      HOST: 0.0.0.0
+      DOCKERIZED: "1"
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
